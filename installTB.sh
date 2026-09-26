@@ -1,95 +1,461 @@
 #!/bin/bash
-# Check if this script is run as root
-if ! [ $(id -u) = 0 ]; then
-   echo "This script must be run as root."
-   exit 1
-fi
+set -Eeuo pipefail
+
+# ============================================================
+# ThingsBoard CE automatic installer
+# Raspberry Pi 4/5 - Raspberry Pi OS 64-bit
+# ThingsBoard CE 4.3.1.5
+# Java 17
+# PostgreSQL 16
+# Nginx reverse proxy
+# ============================================================
+
+TB_VERSION="4.3.1.5"
+TB_DB_NAME="thingsboard"
+TB_DB_USER="postgres"
+TB_DB_PASSWORD=""
+TB_HTTP_PORT="8080"
+NGINX_PORT="80"
+INSTALL_DIR="/opt/thingsboard-installer"
+TB_CONF="/etc/thingsboard/conf/thingsboard.conf"
+TB_PACKAGE="thingsboard-${TB_VERSION}.deb"
+TB_URL="https://github.com/thingsboard/thingsboard/releases/download/v${TB_VERSION}/${TB_PACKAGE}"
+
 START=$(date +%s)
-clear
-whiptail --title "Permission" --yesno "This script will install ThingsBoard IoT platform on Raspberry-Pi. Do you want to continue (yes/no)?" 10 60
-exitstatus=$?
-if [ $exitstatus = 1 ]; then
-exit 1 || return 1
+
+# ------------------------------------------------------------
+# Error handling
+# ------------------------------------------------------------
+trap 'echo; echo "ERROR: Installation failed at line $LINENO."; exit 1' ERR
+
+# ------------------------------------------------------------
+# Root check
+# ------------------------------------------------------------
+if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: This script must be run as root."
+    echo "Run: sudo bash $0"
+    exit 1
 fi
-echo -e "\e[30;48;5;82m***** Welcome. Automatic Installation Begins *****\e[0m"
-sudo apt-get update -y
-sudo apt-get install -y whiptail dialog wget unzip curl
-# Install Open JDK 8
-echo -e "\e[30;48;5;82m*** Install Open JDK 8 ***\e[0m"
-echo 'deb http://ftp.de.debian.org/debian sid main' >> /etc/apt/sources.list
-sudo apt-get update -y
-sudo apt-get install -y openjdk-8-jdk
+
+# ------------------------------------------------------------
+# OS / architecture checks
+# ------------------------------------------------------------
+if [ ! -f /etc/os-release ]; then
+    echo "ERROR: Cannot determine operating system."
+    exit 1
+fi
+
+. /etc/os-release
+
+ARCH="$(dpkg --print-architecture)"
+RAM_MB="$(free -m | awk '/^Mem:/{print $2}')"
+HOSTNAME_SHORT="$(hostname)"
+LOCAL_IP="$(hostname -I | awk '{print $1}')"
+
 clear
-echo -e "\e[31;43m*** Downloading Latest ThingsBoard Package ***\e[0m"
-URL=$(curl -s https://api.github.com/repos/thingsboard/thingsboard/releases/latest | grep browser_download_url.*deb | cut -d '"' -f 4)
-sleep 5
-wget "$URL" 2>&1 |\
-stdbuf -o0 awk '/[.] +[0-9][0-9]?[0-9]?%/ { print substr($0,63,3) }' | \
-dialog --gauge "Downloading Thingsboard Platform. The downloading process may take some minutes depending on the speed of your internet." 10 100
-clear
-echo -e "\e[30;48;5;82m*** Making ThingsBoard Platform Ready for Installation***\e[0m"
-thingsboard="$(find . -name "*.deb")"
-sudo dpkg -i $thingsboard
-echo -e "\e[30;48;5;82m*** Installing PostgreSQL ***\e[0m"
-sudo apt-get install -y postgresql postgresql-contrib
-sudo systemctl enable postgresql
-sudo service postgresql start
-su - postgres -c "psql -U postgres -d postgres -c \"alter user postgres with password 'post24984';\""
-sudo -u postgres psql -c 'create database thingsboard;'
-#echo -e "\e[30;48;5;82m*** Changing Port ***\e[0m"
-#sudo sed -i -e 's/${HTTP_BIND_PORT:8080}/${HTTP_BIND_PORT:8070}/g' /etc/thingsboard/conf/thingsboard.yml
-# Restrict ThingsBoard Memory Usage
-echo -e "\e[30;48;5;82m*** Restrict ThingsBoard Memory Usage ***\e[0m"
-totalRam=$(free -m | awk '/^Mem:/{print $2}')
-#echo $totalRam
-if [ $totalRam -lt 490 ]; then
- echo "WARNING: Thingsboard IoT Platform may run very slow on your Raspberry-Pi."
- echo 'export JAVA_OPTS="$JAVA_OPTS -Dplatform=rpi -Xms256M -Xmx256M"' >> /etc/thingsboard/conf/thingsboard.conf
-elif [ $totalRam -gt 3000 ]; then
- echo "Your RAM is 4GB"
- echo 'export JAVA_OPTS="$JAVA_OPTS -Dplatform=rpi -Xms2048M -Xmx2048M"' >> /etc/thingsboard/conf/thingsboard.conf
-elif [ $totalRam -gt 490 -o $totalRam -lt 1024 ]; then
- echo "Your RAM is 1GB"
- echo 'export JAVA_OPTS="$JAVA_OPTS -Dplatform=rpi -Xms512M -Xmx512M"' >> /etc/thingsboard/conf/thingsboard.conf
+
+echo "============================================================"
+echo "       ThingsBoard Community Edition Installer"
+echo "============================================================"
+echo
+echo "Operating system : ${PRETTY_NAME:-$ID}"
+echo "Architecture     : $ARCH"
+echo "Hostname         : $HOSTNAME_SHORT"
+echo "RAM              : ${RAM_MB} MB"
+echo "ThingsBoard      : $TB_VERSION"
+echo
+
+# ------------------------------------------------------------
+# Architecture check
+# ------------------------------------------------------------
+if [ "$ARCH" != "arm64" ]; then
+    echo "ERROR: This installer requires a 64-bit ARM operating system."
+    echo "Detected architecture: $ARCH"
+    echo
+    echo "Please install Raspberry Pi OS 64-bit."
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# RAM check
+# ------------------------------------------------------------
+if [ "$RAM_MB" -lt 3500 ]; then
+    echo "WARNING: ThingsBoard recommends at least 4 GB RAM."
+    echo "This Raspberry Pi has approximately ${RAM_MB} MB."
+    echo
+    read -r -p "Continue anyway? [y/N]: " ANSWER
+    [[ "$ANSWER" =~ ^[Yy]$ ]] || exit 0
+fi
+
+# ------------------------------------------------------------
+# Confirmation
+# ------------------------------------------------------------
+if command -v whiptail >/dev/null 2>&1; then
+    whiptail --title "ThingsBoard CE Installation" --yesno "This will install ThingsBoard CE ${TB_VERSION}, Java 17, PostgreSQL 16 and Nginx. Continue?" 10 70 || exit 0
 else
- echo "INFO: RAM size unknown."
+    read -r -p "Continue with ThingsBoard installation? [y/N]: " ANSWER
+    [[ "$ANSWER" =~ ^[Yy]$ ]] || exit 0
 fi
-# Configuring database for Thingsboard
-echo -e "\e[30;48;5;82m*** Configuring database for Thingsboard ***\e[0m"
-echo '# DB Configuration' >> /etc/thingsboard/conf/thingsboard.conf
-echo 'export DATABASE_ENTITIES_TYPE=sql' >> /etc/thingsboard/conf/thingsboard.conf
-echo 'export DATABASE_TS_TYPE=sql' >> /etc/thingsboard/conf/thingsboard.conf
-echo 'export SPRING_JPA_DATABASE_PLATFORM=org.hibernate.dialect.PostgreSQLDialect' >> /etc/thingsboard/conf/thingsboard.conf
-echo 'export SPRING_DRIVER_CLASS_NAME=org.postgresql.Driver' >> /etc/thingsboard/conf/thingsboard.conf
-echo 'export SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/thingsboard' >> /etc/thingsboard/conf/thingsboard.conf
-echo 'export SPRING_DATASOURCE_USERNAME=postgres' >> /etc/thingsboard/conf/thingsboard.conf
-echo 'export SPRING_DATASOURCE_PASSWORD=post24984' >> /etc/thingsboard/conf/thingsboard.conf
-echo -e "\e[30;48;5;82m*** Installing ThingsBoard Platform ***\e[0m"
-sudo /usr/share/thingsboard/bin/install/install.sh --loadDemo
-echo -e "\e[30;48;5;82m***** Starting Thingsboard as a Service *****\e[0m"
-sudo systemctl enable thingsboard
-sudo systemctl start thingsboard
-#sudo service thingsboard start
-echo -e "\e[30;48;5;82m*** Finding IP address of the Thingsboard IoT Platform ***\e[0m"
-ipv4=$(curl ifconfig.co)
-ipv41=$(hostname -I)
-# Installing Proxy Server
-echo -e "\e[30;48;5;82m Installing Proxy Server\e[0m"
-sudo apt install nginx -y
-sudo wget "https://raw.githubusercontent.com/msanaullahsahar/nervestretcher/master/thingsboard.conf"
-sudo mv thingsboard.conf /etc/nginx/sites-enabled/
-sudo rm -rf default
-sudo mv thingsboard.conf default
-sudo systemctl restart nginx
-# How to access dashboard?
-echo -e "\e[30;48;5;82m ***** How to access dashboard? *****\e[0m"
-echo -e "\e[30;48;5;82m ThingsBoard platform can be accessed by using any of the following link.\e[0m"
-echo -e "\e[30;48;5;82m http://$ipv4:8080/login\e[0m"
-echo -e "\e[30;48;5;82m http://$ipv41:8080/login\e[0m"
-echo -e "\e[30;48;5;82m http://raspberrypi/login\e[0m"
-echo -e "\e[30;48;5;82m You may need port forwarding (port#8080) by visiting your router's admin page if you wish to access GUI from outside of your private network.\e[0m"
-echo -e "\e[30;48;5;82m***** All Done! *****\e[0m"
+
+# ------------------------------------------------------------
+# PostgreSQL password
+# ------------------------------------------------------------
+echo
+echo "PostgreSQL password is required for the ThingsBoard database."
+echo "You can also set it before running the script:"
+echo
+echo "  sudo TB_DB_PASSWORD='your-password' bash $0"
+echo
+
+if [ -z "$TB_DB_PASSWORD" ]; then
+    read -r -s -p "Enter PostgreSQL password [default: post24984]: " TB_DB_PASSWORD
+    echo
+    [ -n "$TB_DB_PASSWORD" ] || TB_DB_PASSWORD="post24984"
+fi
+
+# ------------------------------------------------------------
+# Package update
+# ------------------------------------------------------------
+echo
+echo "*** Updating Raspberry Pi OS ***"
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+
+# ------------------------------------------------------------
+# Basic packages
+# ------------------------------------------------------------
+echo
+echo "*** Installing required utilities ***"
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    wget \
+    curl \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    whiptail \
+    nginx \
+    apt-transport-https
+
+# ------------------------------------------------------------
+# Java 17
+# ------------------------------------------------------------
+echo
+echo "*** Installing OpenJDK 17 ***"
+
+DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-17-jdk
+
+JAVA17="$(find /usr/lib/jvm -type f -path '*/bin/java' 2>/dev/null | grep 'java-17' | head -n 1 || true)"
+
+if [ -n "$JAVA17" ]; then
+    update-alternatives --set java "$JAVA17" || true
+fi
+
+echo
+echo "Java version:"
+java -version
+
+# ------------------------------------------------------------
+# PostgreSQL repository
+# ------------------------------------------------------------
+echo
+echo "*** Configuring PostgreSQL repository ***"
+
+DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-common
+
+if [ ! -f /etc/apt/sources.list.d/pgdg.sources ] && [ ! -f /etc/apt/sources.list.d/pgdg.list ]; then
+    /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+fi
+
+apt-get update
+
+# ------------------------------------------------------------
+# PostgreSQL 16
+# ------------------------------------------------------------
+echo
+echo "*** Installing PostgreSQL 16 ***"
+
+DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-16
+
+systemctl enable postgresql
+systemctl start postgresql
+
+echo
+echo "*** Waiting for PostgreSQL ***"
+
+for i in {1..30}; do
+    if sudo -u postgres pg_isready >/dev/null 2>&1; then
+        break
+    fi
+    sleep 2
+done
+
+if ! sudo -u postgres pg_isready >/dev/null 2>&1; then
+    echo "ERROR: PostgreSQL did not start correctly."
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# PostgreSQL password
+# ------------------------------------------------------------
+echo
+echo "*** Configuring PostgreSQL user ***"
+
+sudo -u postgres psql -v ON_ERROR_STOP=1 -c "ALTER USER postgres WITH PASSWORD '$TB_DB_PASSWORD';"
+
+# ------------------------------------------------------------
+# Create ThingsBoard database if necessary
+# ------------------------------------------------------------
+echo
+echo "*** Creating ThingsBoard database ***"
+
+if sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${TB_DB_NAME}'" | grep -q 1; then
+    echo "Database '${TB_DB_NAME}' already exists."
+else
+    sudo -u postgres createdb "$TB_DB_NAME"
+    echo "Database '${TB_DB_NAME}' created."
+fi
+
+# ------------------------------------------------------------
+# Download ThingsBoard
+# ------------------------------------------------------------
+echo
+echo "*** Downloading ThingsBoard CE ${TB_VERSION} ***"
+
+mkdir -p "$INSTALL_DIR"
+cd "$INSTALL_DIR"
+
+if [ ! -f "$TB_PACKAGE" ]; then
+    wget --show-progress -O "$TB_PACKAGE" "$TB_URL"
+else
+    echo "$TB_PACKAGE already exists."
+fi
+
+if [ ! -s "$TB_PACKAGE" ]; then
+    echo "ERROR: ThingsBoard package is empty or missing."
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# Install ThingsBoard
+# ------------------------------------------------------------
+echo
+echo "*** Installing ThingsBoard CE ${TB_VERSION} ***"
+
+dpkg -i "$INSTALL_DIR/$TB_PACKAGE" || {
+    echo
+    echo "*** Fixing package dependencies ***"
+    apt-get install -f -y
+}
+
+# ------------------------------------------------------------
+# ThingsBoard configuration
+# ------------------------------------------------------------
+echo
+echo "*** Configuring ThingsBoard ***"
+
+if [ ! -f "$TB_CONF" ]; then
+    mkdir -p "$(dirname "$TB_CONF")"
+    touch "$TB_CONF"
+fi
+
+cp "$TB_CONF" "${TB_CONF}.backup.$(date +%Y%m%d%H%M%S)"
+
+# Remove configuration previously generated by this installer.
+sed -i '/^# BEGIN AUTOMATIC RPI CONFIGURATION$/,/^# END AUTOMATIC RPI CONFIGURATION$/d' "$TB_CONF"
+
+cat >> "$TB_CONF" <<EOF
+
+# BEGIN AUTOMATIC RPI CONFIGURATION
+
+# PostgreSQL database
+export DATABASE_TS_TYPE=sql
+export SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/${TB_DB_NAME}
+export SPRING_DATASOURCE_USERNAME=${TB_DB_USER}
+export SPRING_DATASOURCE_PASSWORD=${TB_DB_PASSWORD}
+
+# HTTP
+export HTTP_BIND_PORT=${TB_HTTP_PORT}
+
+# END AUTOMATIC RPI CONFIGURATION
+EOF
+
+chmod 600 "$TB_CONF"
+
+# ------------------------------------------------------------
+# JVM memory
+# ------------------------------------------------------------
+echo
+echo "*** Configuring ThingsBoard JVM memory ***"
+
+# ThingsBoard recommends approximately half of available RAM.
+if [ "$RAM_MB" -ge 7000 ]; then
+    HEAP="4G"
+elif [ "$RAM_MB" -ge 5000 ]; then
+    HEAP="3G"
+elif [ "$RAM_MB" -ge 3500 ]; then
+    HEAP="2G"
+elif [ "$RAM_MB" -ge 1800 ]; then
+    HEAP="1G"
+else
+    HEAP="768M"
+fi
+
+sed -i '/^# BEGIN AUTOMATIC JVM CONFIGURATION$/,/^# END AUTOMATIC JVM CONFIGURATION$/d' "$TB_CONF"
+
+cat >> "$TB_CONF" <<EOF
+
+# BEGIN AUTOMATIC JVM CONFIGURATION
+export JAVA_OPTS="\$JAVA_OPTS -Xms${HEAP} -Xmx${HEAP}"
+# END AUTOMATIC JVM CONFIGURATION
+EOF
+
+echo "ThingsBoard JVM heap: $HEAP"
+
+# ------------------------------------------------------------
+# ThingsBoard database initialisation
+# ------------------------------------------------------------
+echo
+echo "*** Initialising ThingsBoard database ***"
+
+if [ ! -f /var/lib/thingsboard/.database_initialised ]; then
+    /usr/share/thingsboard/bin/install/install.sh --loadDemo
+    mkdir -p /var/lib/thingsboard
+    touch /var/lib/thingsboard/.database_initialised
+else
+    echo "ThingsBoard database has already been initialised."
+    echo "Skipping database initialisation."
+fi
+
+# ------------------------------------------------------------
+# Nginx reverse proxy
+# ------------------------------------------------------------
+echo
+echo "*** Configuring Nginx reverse proxy ***"
+
+cat > /etc/nginx/sites-available/thingsboard <<'EOF'
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+
+    server_name _;
+
+    client_max_body_size 50M;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Port $server_port;
+
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
+EOF
+
+rm -f /etc/nginx/sites-enabled/default
+ln -sf /etc/nginx/sites-available/thingsboard /etc/nginx/sites-enabled/thingsboard
+
+echo
+echo "*** Testing Nginx configuration ***"
+nginx -t
+
+systemctl enable nginx
+systemctl restart nginx
+
+# ------------------------------------------------------------
+# Start ThingsBoard
+# ------------------------------------------------------------
+echo
+echo "*** Starting ThingsBoard ***"
+
+systemctl daemon-reload
+systemctl enable thingsboard
+systemctl restart thingsboard
+
+# ------------------------------------------------------------
+# Wait for ThingsBoard
+# ------------------------------------------------------------
+echo
+echo "*** Waiting for ThingsBoard to start ***"
+echo "This can take several minutes on a Raspberry Pi."
+
+TB_READY=0
+
+for i in {1..120}; do
+    if curl -fsS "http://127.0.0.1:${TB_HTTP_PORT}/" >/dev/null 2>&1; then
+        TB_READY=1
+        break
+    fi
+    sleep 2
+done
+
+# ------------------------------------------------------------
+# Final information
+# ------------------------------------------------------------
+LOCAL_IP="$(hostname -I | awk '{print $1}')"
 END=$(date +%s)
-DIFF=$(( $END - $START ))
-echo "It took $DIFF seconds to complete this installaion process."
-echo "Please reboot manually otherwise Thingsboard IoT platform may not start properly ...."
+ELAPSED=$((END-START))
+
+clear
+
+echo "============================================================"
+echo "       ThingsBoard CE Installation Complete"
+echo "============================================================"
+echo
+echo "ThingsBoard version : $TB_VERSION"
+echo "Raspberry Pi arch   : $ARCH"
+echo "RAM                 : ${RAM_MB} MB"
+echo "JVM heap            : $HEAP"
+echo "PostgreSQL          : 16"
+echo
+echo "Web interface:"
+echo "  http://${LOCAL_IP}/"
+echo
+echo "Direct ThingsBoard:"
+echo "  http://${LOCAL_IP}:8080/"
+echo
+echo "MQTT:"
+echo "  ${LOCAL_IP}:1883"
+echo
+echo "PostgreSQL:"
+echo "  localhost:5432"
+echo
+echo "Nginx:"
+echo "  ${LOCAL_IP}:80 -> ThingsBoard :8080"
+echo
+echo "Installation time: ${ELAPSED} seconds"
+echo
+
+if [ "$TB_READY" -eq 1 ]; then
+    echo "ThingsBoard HTTP service: READY"
+else
+    echo "ThingsBoard HTTP service: NOT READY YET"
+    echo
+    echo "Check the service with:"
+    echo "  sudo systemctl status thingsboard"
+    echo
+    echo "Check the log with:"
+    echo "  sudo journalctl -u thingsboard -n 100 --no-pager"
+    echo
+    echo "ThingsBoard log:"
+    echo "  sudo tail -n 100 /var/log/thingsboard/thingsboard.log"
+fi
+
+echo
+echo "Services:"
+echo "  sudo systemctl status thingsboard"
+echo "  sudo systemctl status postgresql"
+echo "  sudo systemctl status nginx"
+echo
+echo "============================================================"
+echo "Installation finished."
+echo "============================================================"
